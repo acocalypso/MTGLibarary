@@ -7,6 +7,7 @@ src/mtg_cards/config.py
 src/mtg_cards/csv_importer.py
 src/mtg_cards/db.py
 src/mtg_cards/deck.py
+src/mtg_cards/decks.py
 src/mtg_cards/images.py
 src/mtg_cards/paths.py
 src/mtg_cards/scryfall.py

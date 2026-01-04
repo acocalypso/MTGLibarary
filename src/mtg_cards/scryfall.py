@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
@@ -120,11 +121,40 @@ def _is_token(card: dict) -> int:
     return 0
 
 
-def import_scryfall_all_cards_json(*, conn, json_path: Path, bulk_updated_at: str, on_status) -> None:
+def import_scryfall_all_cards_json(*, conn, json_path: Path, bulk_updated_at: str, on_status, on_progress=None) -> None:
     # Import is large; keep memory bounded by batching.
     batch: list[tuple] = []
     batch_size = 1000
     seen = 0
+
+    # We'll report a scaled (0..1000) progress based on bytes read so we can keep
+    # UI progress stable even when the JSON is >2GB.
+    size: int | None = None
+    try:
+        size = int(json_path.stat().st_size)
+    except Exception:
+        size = None
+    scale = 1000
+    last_emit = 0.0
+
+    def _emit_progress(f) -> None:
+        nonlocal last_emit
+        if on_progress is None or not size or size <= 0:
+            return
+        now = time.monotonic()
+        if now - last_emit < 0.25:
+            return
+        last_emit = now
+        try:
+            pos = int(f.tell())
+        except Exception:
+            return
+        current = int((pos / size) * scale)
+        if current < 0:
+            current = 0
+        if current > scale:
+            current = scale
+        on_progress(current, scale)
 
     sql = """
         INSERT INTO printings(
@@ -142,17 +172,25 @@ def import_scryfall_all_cards_json(*, conn, json_path: Path, bulk_updated_at: st
     conn.execute("PRAGMA foreign_keys=OFF")
     try:
         with transaction(conn):
+            # Speed up bulk import by dropping indexes and recreating them after.
+            conn.execute("DROP INDEX IF EXISTS idx_printings_name")
+            conn.execute("DROP INDEX IF EXISTS idx_printings_set")
+            conn.execute("DROP INDEX IF EXISTS idx_printings_type")
+
             conn.execute("DELETE FROM printings")
 
             on_status("Streaming Scryfall JSON…")
             with json_path.open("rb") as f:
+                if on_progress is not None:
+                    on_progress(0, scale)
                 for card in ijson.items(f, "item"):
                     if not isinstance(card, dict):
                         continue
 
                     seen += 1
-                    if seen % 25000 == 0:
+                    if seen % 5000 == 0:
                         on_status(f"Importing… {seen:,} cards")
+                    _emit_progress(f)
 
                     scryfall_id = card.get("id")
                     if not scryfall_id:
@@ -188,15 +226,24 @@ def import_scryfall_all_cards_json(*, conn, json_path: Path, bulk_updated_at: st
                     if len(batch) >= batch_size:
                         conn.executemany(sql, batch)
                         batch.clear()
+                        _emit_progress(f)
 
             if batch:
                 conn.executemany(sql, batch)
                 batch.clear()
 
+            # Recreate indexes after import.
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_printings_name ON printings(name)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_printings_set ON printings(set_code)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_printings_type ON printings(type_line)")
+
             if bulk_updated_at:
                 meta_set(conn, "scryfall.bulk.updated_at", bulk_updated_at)
     finally:
         conn.execute("PRAGMA foreign_keys=ON")
+
+    if on_progress is not None:
+        on_progress(scale, scale)
 
     # Clean up any owned rows that reference vanished printings.
     conn.execute(

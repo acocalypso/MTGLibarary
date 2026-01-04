@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import shutil
+import sys
 
 
 def repo_root() -> Path:
@@ -15,8 +16,21 @@ def repo_root() -> Path:
     return here.parents[2]
 
 
+def app_root() -> Path:
+    """Base folder for app-owned writable files.
+
+    In dev/editable installs, this is the repository root.
+    In a frozen executable (PyInstaller), this is the folder containing the exe.
+    """
+    if bool(getattr(sys, "frozen", False)):
+        # Onefile apps extract Python modules to a temporary directory, but the
+        # executable itself lives where the user launched it from.
+        return Path(sys.executable).resolve().parent
+    return repo_root()
+
+
 def data_dir() -> Path:
-    root = repo_root()
+    root = app_root()
     path = root / "data"
     path.mkdir(parents=True, exist_ok=True)
 
@@ -47,6 +61,6 @@ def db_path() -> Path:
 
 
 def imports_dirs() -> list[Path]:
-    root = repo_root()
+    root = app_root()
     # Support both the spec folder (`imports/`) and a legacy folder (`import/`) already present.
     return [root / "imports", root / "import"]

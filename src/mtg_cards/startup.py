@@ -96,7 +96,13 @@ def ensure_scryfall_up_to_date(
     on_status("Importing Scryfall database…")
     # Switch progress dialog to indeterminate for the import phase.
     on_progress(0, 0)
-    import_scryfall_all_cards_json(conn=conn, json_path=dest, bulk_updated_at=bulk_updated_at, on_status=on_status)
+    import_scryfall_all_cards_json(
+        conn=conn,
+        json_path=dest,
+        bulk_updated_at=bulk_updated_at,
+        on_status=on_status,
+        on_progress=on_progress,
+    )
 
     return True
 

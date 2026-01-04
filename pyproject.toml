@@ -14,6 +14,11 @@ dependencies = [
   "packaging>=25.0",
 ]
 
+[project.optional-dependencies]
+dev = [
+  "pyinstaller>=6.11",
+]
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 

@@ -6,3 +6,8 @@ __pycache__/
 *.sqlite3
 import/*
 imports/*.csv
+
+# Build artifacts
+build/
+dist/
+*.spec

@@ -99,7 +99,20 @@ def import_csv_file(conn, csv_path: Path) -> ImportResult:
                     ],
                 )
 
-                scryfall_id = _resolve_printing_scryfall_id(conn, name=name, set_code=set_code, collector=collector)
+                # ManaBox exports include a direct Scryfall UUID; use it when available.
+                scryfall_id = _first_present(row, ["scryfall id", "scryfall_id", "scryfall uuid"])
+                if scryfall_id:
+                    exists = conn.execute(
+                        "SELECT 1 FROM printings WHERE scryfall_id = ? LIMIT 1",
+                        (str(scryfall_id).strip(),),
+                    ).fetchone()
+                    if exists is None:
+                        scryfall_id = ""
+
+                if not scryfall_id:
+                    scryfall_id = _resolve_printing_scryfall_id(
+                        conn, name=name, set_code=set_code, collector=collector
+                    )
                 if not scryfall_id:
                     rows_unmatched += 1
                     continue
