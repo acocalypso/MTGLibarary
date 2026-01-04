@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import shutil
 import sys
+import os
 
 
 def repo_root() -> Path:
@@ -29,8 +30,21 @@ def app_root() -> Path:
     return repo_root()
 
 
+def user_data_root() -> Path:
+    """Per-user writable root for app data.
+
+    Used for frozen/installed builds where the install directory is typically
+    under Program Files and not writable.
+    """
+    # Prefer LocalAppData (no roaming). Fall back to Roaming AppData, then home.
+    base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+    if base:
+        return Path(base) / "MTGLibarary"
+    return Path.home() / ".mtg_cards"
+
+
 def data_dir() -> Path:
-    root = app_root()
+    root = user_data_root() if bool(getattr(sys, "frozen", False)) else app_root()
     path = root / "data"
     path.mkdir(parents=True, exist_ok=True)
 
@@ -61,6 +75,10 @@ def db_path() -> Path:
 
 
 def imports_dirs() -> list[Path]:
+    if bool(getattr(sys, "frozen", False)):
+        root = user_data_root()
+        return [root / "imports", root / "import"]
+
     root = app_root()
     # Support both the spec folder (`imports/`) and a legacy folder (`import/`) already present.
     return [root / "imports", root / "import"]

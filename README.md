@@ -42,15 +42,53 @@ To build a single-file executable instead:
 powershell -ExecutionPolicy Bypass -File scripts/build_exe.ps1 -OneFile
 ```
 
+## Build a Windows setup wizard (installer)
+
+This project includes an Inno Setup script that produces a standard Windows “Setup Wizard” installer.
+
+1) Install Inno Setup (version 6+). For example:
+
+```powershell
+winget install InnoSetup.InnoSetup
+```
+
+2) Build the installer:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/build_installer.ps1
+```
+
+Output:
+
+- `dist/MTGLibarary-Setup.exe`
+
 ## Folders
 
 - `imports/` (and legacy `import/`): place CSV files to import.
 - `data/`: local app data (SQLite DB, Scryfall bulk JSON cache, image cache). Ignored by git.
 
+### Installed app data location (Windows)
+
+When installed via the setup wizard, the app cannot write to its install folder (typically under `Program Files`).
+In that case it stores writable files per-user under:
+
+- `%LOCALAPPDATA%\MTGLibarary\data\` (DB + caches)
+- `%LOCALAPPDATA%\MTGLibarary\imports\` (CSV drop folder)
+
+### Reset / clean start
+
+To reset the app (remove local database + caches), close the app and delete:
+
+- `%LOCALAPPDATA%\MTGLibarary\data\`
+
+This does not uninstall the program, it only clears your local data.
+
 ## CSV import
 
 - Use **File → Import CSV…** (Ctrl+I) to add one or more CSV files into `imports/` and import them.
 - Or drop CSV files manually into `imports/` and click **Import CSVs** in the Collection tab.
+
+Tip (installer build): if you want a “watched folder” approach, drop CSVs into `%LOCALAPPDATA%\MTGLibarary\imports\`.
 
 ### Supported CSV exports
 

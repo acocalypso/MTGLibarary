@@ -11,3 +11,6 @@ imports/*.csv
 build/
 dist/
 *.spec
+
+# Installer outputs
+*Setup.exe
