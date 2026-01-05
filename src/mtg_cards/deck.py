@@ -26,6 +26,10 @@ def parse_decklist(text: str) -> list[DeckEntry]:
         if line.startswith("#") or line.startswith("//"):
             continue
 
+        # Allow inline comments/annotations (e.g. "# !Commander").
+        if " #" in line:
+            line = line.split(" #", 1)[0].strip()
+
         m = _DECK_LINE_RE.match(line)
         if not m:
             continue

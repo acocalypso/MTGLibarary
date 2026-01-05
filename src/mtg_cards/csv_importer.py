@@ -48,12 +48,99 @@ def _parse_quantity(text: str) -> int:
 
 
 def import_csv_file(conn, csv_path: Path) -> ImportResult:
-    file_hash = sha256_file(csv_path)
+    with csv_path.open("r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames is None:
+            raise ValueError(f"CSV has no header: {csv_path}")
+        rows = list(reader)
+    return import_rows(conn, source_path=csv_path, rows=rows)
+
+
+def import_mapped_file(
+    conn,
+    *,
+    source_path: Path,
+    mode: str,
+    mapping: dict[str, str | None],
+) -> ImportResult:
+    """Import from an arbitrary user-chosen file using a user-provided mapping.
+
+    mode:
+      - "csv": reads as delimited file with header
+      - "decklist": reads as decklist-like txt and parses `qty name` lines
+
+    mapping keys (all optional):
+      - name, quantity, set_code, collector_number, scryfall_id
+    """
+    if mode == "decklist":
+        from mtg_cards.deck import parse_decklist
+
+        text = source_path.read_text(encoding="utf-8", errors="ignore")
+        entries = parse_decklist(text)
+        # Expose decklist-derived columns for mapping.
+        rows_in: list[dict[str, str]] = []
+        for e in entries:
+            rows_in.append(
+                {
+                    "qty": str(e.qty),
+                    "name": e.name,
+                    "set": e.set_code or "",
+                    "collector": e.collector_number or "",
+                }
+            )
+
+        mapped_rows: list[dict[str, str]] = []
+        defaults = {
+            "quantity": "qty",
+            "name": "name",
+            "set_code": "set",
+            "collector_number": "collector",
+            "scryfall_id": None,
+        }
+        for row in rows_in:
+            out: dict[str, str] = {}
+            for key in ["name", "quantity", "set_code", "collector_number", "scryfall_id"]:
+                col = mapping.get(key) if key in mapping else None
+                if not col:
+                    col = defaults.get(key)
+                if col:
+                    out[key] = row.get(col, "")
+            mapped_rows.append(out)
+
+        return import_rows(conn, source_path=source_path, rows=mapped_rows)
+
+    # Default: csv-like
+    with source_path.open("r", encoding="utf-8-sig", newline="") as f:
+        sample = f.read(32 * 1024)
+        f.seek(0)
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=[",", "\t", ";", "|"])
+        except Exception:
+            dialect = csv.excel
+        reader = csv.DictReader(f, dialect=dialect)
+        if reader.fieldnames is None:
+            raise ValueError(f"File has no header: {source_path}")
+
+        mapped_rows: list[dict[str, str]] = []
+        for row in reader:
+            out: dict[str, str] = {}
+            for key in ["name", "quantity", "set_code", "collector_number", "scryfall_id"]:
+                col = mapping.get(key)
+                if col:
+                    out[key] = "" if row.get(col) is None else str(row.get(col) or "")
+            mapped_rows.append(out)
+
+    return import_rows(conn, source_path=source_path, rows=mapped_rows)
+
+
+def import_rows(conn, *, source_path: Path, rows: Iterable[dict[str, str]]) -> ImportResult:
+    """Core import logic from an iterable of row dicts."""
+    file_hash = sha256_file(source_path)
 
     already = conn.execute("SELECT 1 FROM import_files WHERE file_hash = ?", (file_hash,)).fetchone()
     if already is not None:
         return ImportResult(
-            file=csv_path,
+            file=source_path,
             skipped_already_imported=True,
             rows_seen=0,
             rows_imported=0,
@@ -68,74 +155,76 @@ def import_csv_file(conn, csv_path: Path) -> ImportResult:
     quantity_added = 0
     matched: set[str] = set()
 
-    with csv_path.open("r", encoding="utf-8-sig", newline="") as f:
-        reader = csv.DictReader(f)
-        if reader.fieldnames is None:
-            raise ValueError(f"CSV has no header: {csv_path}")
+    with transaction(conn):
+        for row in rows:
+            rows_seen += 1
 
-        with transaction(conn):
-            for row in reader:
-                rows_seen += 1
-
-                qty = _parse_quantity(
-                    _first_present(row, ["quantity", "qty", "count", "amount", "owned"])
-                )
-                if qty <= 0:
-                    continue
-
-                name = _first_present(row, ["name", "card", "card name", "card_name"])
-                if not name:
-                    continue
-
-                set_code = _first_present(row, ["set", "set code", "set_code"])
-                collector = _first_present(
+            qty = _parse_quantity(
+                _first_present(
                     row,
                     [
-                        "collector_number",
-                        "collector",
-                        "collector number",
-                        "number",
-                        "cn",
+                        "quantity",
+                        "qty",
+                        "count",
+                        "amount",
+                        "owned",
                     ],
                 )
+            )
+            if qty <= 0:
+                continue
 
-                # ManaBox exports include a direct Scryfall UUID; use it when available.
-                scryfall_id = _first_present(row, ["scryfall id", "scryfall_id", "scryfall uuid"])
-                if scryfall_id:
-                    exists = conn.execute(
-                        "SELECT 1 FROM printings WHERE scryfall_id = ? LIMIT 1",
-                        (str(scryfall_id).strip(),),
-                    ).fetchone()
-                    if exists is None:
-                        scryfall_id = ""
+            name = _first_present(row, ["name", "card", "card name", "card_name"])
+            if not name:
+                continue
 
-                if not scryfall_id:
-                    scryfall_id = _resolve_printing_scryfall_id(
-                        conn, name=name, set_code=set_code, collector=collector
-                    )
-                if not scryfall_id:
-                    rows_unmatched += 1
-                    continue
-
-                conn.execute(
-                    """
-                    INSERT INTO owned_printings(scryfall_id, quantity)
-                    VALUES(?, ?)
-                    ON CONFLICT(scryfall_id) DO UPDATE SET quantity = quantity + excluded.quantity
-                    """,
-                    (scryfall_id, qty),
-                )
-                rows_imported += 1
-                quantity_added += qty
-                matched.add(str(scryfall_id))
-
-            conn.execute(
-                "INSERT INTO import_files(file_hash, filename, imported_at) VALUES(?, ?, ?)",
-                (file_hash, csv_path.name, dt.datetime.utcnow().isoformat(timespec="seconds") + "Z"),
+            set_code = _first_present(row, ["set_code", "set", "set code"])
+            collector = _first_present(
+                row,
+                [
+                    "collector_number",
+                    "collector",
+                    "collector number",
+                    "number",
+                    "cn",
+                ],
             )
 
+            # Prefer explicit Scryfall id when present.
+            scryfall_id = _first_present(row, ["scryfall_id", "scryfall id", "scryfall uuid"])
+            if scryfall_id:
+                exists = conn.execute(
+                    "SELECT 1 FROM printings WHERE scryfall_id = ? LIMIT 1",
+                    (str(scryfall_id).strip(),),
+                ).fetchone()
+                if exists is None:
+                    scryfall_id = ""
+
+            if not scryfall_id:
+                scryfall_id = _resolve_printing_scryfall_id(conn, name=name, set_code=set_code, collector=collector)
+            if not scryfall_id:
+                rows_unmatched += 1
+                continue
+
+            conn.execute(
+                """
+                INSERT INTO owned_printings(scryfall_id, quantity)
+                VALUES(?, ?)
+                ON CONFLICT(scryfall_id) DO UPDATE SET quantity = quantity + excluded.quantity
+                """,
+                (scryfall_id, qty),
+            )
+            rows_imported += 1
+            quantity_added += qty
+            matched.add(str(scryfall_id))
+
+        conn.execute(
+            "INSERT INTO import_files(file_hash, filename, imported_at) VALUES(?, ?, ?)",
+            (file_hash, source_path.name, dt.datetime.utcnow().isoformat(timespec="seconds") + "Z"),
+        )
+
     return ImportResult(
-        file=csv_path,
+        file=source_path,
         skipped_already_imported=False,
         rows_seen=rows_seen,
         rows_imported=rows_imported,

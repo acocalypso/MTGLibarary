@@ -146,3 +146,17 @@ def transaction(conn: sqlite3.Connection) -> Iterator[None]:
         else:
             conn.rollback()
         raise
+
+
+def clear_imported_cards(conn: sqlite3.Connection) -> None:
+    """Clears imported collection quantities.
+
+    This removes:
+    - `owned_printings` rows (the owned quantities imported from files)
+    - `import_files` rows (so previously imported files can be re-imported)
+
+    It does NOT remove Scryfall card data in `printings`, and it does NOT touch decks.
+    """
+    with transaction(conn):
+        conn.execute("DELETE FROM owned_printings")
+        conn.execute("DELETE FROM import_files")

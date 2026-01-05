@@ -19,4 +19,5 @@ src/mtg_cards.egg-info/SOURCES.txt
 src/mtg_cards.egg-info/dependency_links.txt
 src/mtg_cards.egg-info/requires.txt
 src/mtg_cards.egg-info/top_level.txt
+src/mtg_cards/ui/import_mapper.py
 src/mtg_cards/ui/main_window.py

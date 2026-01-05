@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import json
 import sys
-import shutil
-import time
 from pathlib import Path
 
 from PySide6.QtCore import QThreadPool, Qt, QTimer, QStringListModel
@@ -14,6 +12,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QDialog,
     QMainWindow,
     QMessageBox,
     QProgressDialog,
@@ -33,13 +32,14 @@ from PySide6.QtWidgets import (
 )
 
 from mtg_cards import __version__
-from mtg_cards.db import connect, init_db, json_loads
+from mtg_cards.db import clear_imported_cards, connect, init_db, json_loads
 from mtg_cards.decks import create_deck, delete_deck, get_deck, list_decks, update_deck
 from mtg_cards.deck import parse_decklist, validate_deck
 from mtg_cards.images import fetch_image_to_cache
-from mtg_cards.paths import db_path, imports_dirs
-from mtg_cards.startup import check_app_update, ensure_scryfall_up_to_date, import_all_csvs, scryfall_update_available
+from mtg_cards.paths import db_path
+from mtg_cards.startup import check_app_update, ensure_scryfall_up_to_date, scryfall_update_available
 from mtg_cards.workers import Worker, WorkerRequest
+from mtg_cards.ui.import_mapper import ImportMapperDialog
 
 
 class MainWindow(QMainWindow):
@@ -51,6 +51,12 @@ class MainWindow(QMainWindow):
         self._build_menus()
 
         self._pool = QThreadPool.globalInstance()
+
+        # Keep a reference to short-lived workers (prevents premature GC).
+        # Must be initialized before any startup tasks schedule background workers.
+        self._deck_worker: Worker | None = None
+        self._workers_keepalive: list[Worker] = []
+
         self._conn = connect(db_path())
         init_db(self._conn)
 
@@ -90,13 +96,6 @@ class MainWindow(QMainWindow):
         )
         self._startup_begin()
 
-        # Used to decide whether to show a detailed import-complete popup.
-        self._csv_import_show_summary = False
-
-        # Keep a reference to short-lived workers (prevents premature GC).
-        self._deck_worker: Worker | None = None
-        self._workers_keepalive: list[Worker] = []
-
         self._active_deck_id: int | None = None
 
     def _build_menus(self) -> None:
@@ -106,10 +105,145 @@ class MainWindow(QMainWindow):
         import_action.setShortcut("Ctrl+I")
         import_action.triggered.connect(self._import_csv_via_dialog)
 
+        import_any_action = file_menu.addAction("Import file…")
+        import_any_action.setShortcut("Ctrl+Shift+I")
+        import_any_action.triggered.connect(self._import_file_with_mapping)
+
         file_menu.addSeparator()
         exit_action = file_menu.addAction("Exit")
         exit_action.setShortcut("Alt+F4")
         exit_action.triggered.connect(self.close)
+
+        tools_menu = self.menuBar().addMenu("Tools")
+        clear_action = tools_menu.addAction("Clear imported cards…")
+        clear_action.triggered.connect(self._clear_imported_cards)
+
+    def _start_worker(self, w: Worker) -> None:
+        # Keep workers alive until they emit finished/failed; otherwise Python may GC
+        # the QRunnable wrapper and we can miss signals (e.g., no completion popup).
+        self._workers_keepalive.append(w)
+
+        def _cleanup(_=None) -> None:
+            try:
+                self._workers_keepalive.remove(w)
+            except ValueError:
+                pass
+
+        w.signals.finished.connect(_cleanup)
+        w.signals.failed.connect(_cleanup)
+        self._pool.start(w)
+
+    def _with_table_sort_preserved(self, table: QTableWidget, fn) -> None:
+        header = table.horizontalHeader()
+        section = int(header.sortIndicatorSection())
+        order = header.sortIndicatorOrder()
+        was_sorting = table.isSortingEnabled()
+
+        table.setSortingEnabled(False)
+        try:
+            fn()
+        finally:
+            table.setSortingEnabled(was_sorting)
+            if table.isSortingEnabled() and table.rowCount() > 1:
+                table.sortItems(section, order)
+
+    @staticmethod
+    def _int_item(value: int) -> QTableWidgetItem:
+        it = QTableWidgetItem(str(int(value)))
+        it.setData(Qt.ItemDataRole.EditRole, int(value))
+        return it
+
+    def _clear_imported_cards(self) -> None:
+        resp = QMessageBox.question(
+            self,
+            "Clear imported cards",
+            "This will remove all owned quantities imported into your collection.\n\n"
+            "Scryfall card data and decks will be kept.\n\n"
+            "Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if resp != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            clear_imported_cards(self._conn)
+        except Exception as e:
+            QMessageBox.critical(self, "Clear imported cards", f"Failed to clear imported cards:\n\n{e}")
+            return
+
+        self.refresh_search()
+        self.refresh_stats()
+        self.statusBar().showMessage("Imported cards cleared")
+
+    def _import_file_with_mapping(self) -> None:
+        file, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import file",
+            "",
+            "Data files (*.csv *.tsv *.txt);;All files (*.*)",
+        )
+        if not file:
+            return
+
+        path = Path(file)
+        dlg = ImportMapperDialog(parent=self, path=path)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        plan = dlg.plan()
+
+        # Ensure Scryfall exists before importing quantities.
+        if self._conn.execute("SELECT COUNT(*) FROM printings").fetchone()[0] == 0:
+            QMessageBox.information(
+                self,
+                "Import",
+                "Scryfall card data is not ready yet. Please finish the initial Scryfall download/import first.",
+            )
+            return
+
+        self._show_progress("Importing file…")
+        req = WorkerRequest(
+            fn=_import_mapped_file_worker,
+            kwargs={
+                "db_file": str(db_path()),
+                "source_path": str(path),
+                "mode": str(plan.mode),
+                "mapping": {
+                    "quantity": plan.mapping.quantity,
+                    "name": plan.mapping.name,
+                    "set_code": plan.mapping.set_code,
+                    "collector_number": plan.mapping.collector_number,
+                    "scryfall_id": plan.mapping.scryfall_id,
+                },
+            },
+        )
+        w = Worker(req)
+        w.signals.status.connect(self._progress.setLabelText)  # type: ignore[union-attr]
+        w.signals.progress.connect(self._on_progress)
+        w.signals.failed.connect(self._on_worker_failed)
+        w.signals.finished.connect(lambda res: self._on_custom_file_import_done(res))
+        self._start_worker(w)
+
+    def _on_custom_file_import_done(self, result: object) -> None:
+        self._close_progress()
+        self.refresh_search()
+        self.refresh_stats()
+
+        if result is None:
+            self.statusBar().showMessage("Import complete")
+            return
+
+        name = getattr(getattr(result, "file", None), "name", None) or "(file)"
+        if getattr(result, "skipped_already_imported", False):
+            msg = f"Import skipped — {name} was already imported"
+        else:
+            qty_added = int(getattr(result, "quantity_added", 0) or 0)
+            matched = int(getattr(result, "distinct_printings_matched", 0) or 0)
+            unmatched = int(getattr(result, "rows_unmatched", 0) or 0)
+            msg = f"Import complete — +{qty_added} copies, {matched} printings matched, {unmatched} unmatched rows"
+
+        self.statusBar().showMessage(msg)
+        QMessageBox.information(self, "Import", msg)
 
     # -------------------------
     # UI: Collection
@@ -141,15 +275,14 @@ class MainWindow(QMainWindow):
 
         btn_row = QHBoxLayout()
         self._btn_search = QPushButton("Search")
-        self._btn_import = QPushButton("Import CSVs")
         self._btn_refresh_scry = QPushButton("Update Scryfall")
         btn_row.addWidget(self._btn_search)
-        btn_row.addWidget(self._btn_import)
         btn_row.addWidget(self._btn_refresh_scry)
         left_layout.addLayout(btn_row)
 
         self._table = QTableWidget(0, 3)
         self._table.setHorizontalHeaderLabels(["Card", "Set", "Owned"])
+        self._table.setSortingEnabled(True)
         self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self._table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self._table.verticalHeader().setVisible(False)
@@ -176,7 +309,6 @@ class MainWindow(QMainWindow):
 
         # Signals
         self._btn_search.clicked.connect(self.refresh_search)
-        self._btn_import.clicked.connect(lambda: self._run_csv_import(show_summary=True))
         self._btn_refresh_scry.clicked.connect(lambda: self._run_scryfall_sync(show_dialog=True))
 
         self._q_name.textChanged.connect(lambda: self._debounce.start())
@@ -204,6 +336,7 @@ class MainWindow(QMainWindow):
 
         self._stats_table = QTableWidget(0, 3)
         self._stats_table.setHorizontalHeaderLabels(["Set", "Distinct printings", "Total copies"])
+        self._stats_table.setSortingEnabled(True)
         self._stats_table.verticalHeader().setVisible(False)
         self._stats_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         layout.addWidget(self._stats_table, 1)
@@ -229,25 +362,28 @@ class MainWindow(QMainWindow):
             """
         ).fetchall()
 
-        self._stats_table.setRowCount(len(rows))
-        total_sets = len(rows)
-        total_copies = 0
-        total_distinct = 0
+        def _fill() -> None:
+            self._stats_table.setRowCount(len(rows))
+            total_sets = len(rows)
+            total_copies = 0
+            total_distinct = 0
 
-        for i, r in enumerate(rows):
-            set_code = str(r["set_code"]).upper()
-            distinct = int(r["distinct_printings"]) if r["distinct_printings"] is not None else 0
-            copies = int(r["total_copies"]) if r["total_copies"] is not None else 0
-            total_copies += copies
-            total_distinct += distinct
+            for i, r in enumerate(rows):
+                set_code = str(r["set_code"]).upper()
+                distinct = int(r["distinct_printings"]) if r["distinct_printings"] is not None else 0
+                copies = int(r["total_copies"]) if r["total_copies"] is not None else 0
+                total_copies += copies
+                total_distinct += distinct
 
-            self._stats_table.setItem(i, 0, QTableWidgetItem(set_code))
-            self._stats_table.setItem(i, 1, QTableWidgetItem(str(distinct)))
-            self._stats_table.setItem(i, 2, QTableWidgetItem(str(copies)))
+                self._stats_table.setItem(i, 0, QTableWidgetItem(set_code))
+                self._stats_table.setItem(i, 1, self._int_item(distinct))
+                self._stats_table.setItem(i, 2, self._int_item(copies))
 
-        self._stats_summary.setText(
-            f"Sets: {total_sets}   Distinct printings: {total_distinct}   Total copies: {total_copies}"
-        )
+            self._stats_summary.setText(
+                f"Sets: {total_sets}   Distinct printings: {total_distinct}   Total copies: {total_copies}"
+            )
+
+        self._with_table_sort_preserved(self._stats_table, _fill)
 
     def refresh_search(self) -> None:
         name = self._q_name.text().strip()
@@ -284,13 +420,17 @@ class MainWindow(QMainWindow):
         )
 
         rows = self._conn.execute(sql, params).fetchall()
-        self._table.setRowCount(len(rows))
-        for i, r in enumerate(rows):
-            item0 = QTableWidgetItem(str(r["name"]))
-            item0.setData(Qt.ItemDataRole.UserRole, str(r["scryfall_id"]))
-            self._table.setItem(i, 0, item0)
-            self._table.setItem(i, 1, QTableWidgetItem(str(r["set_code"]).upper()))
-            self._table.setItem(i, 2, QTableWidgetItem(str(r["qty"])))
+
+        def _fill() -> None:
+            self._table.setRowCount(len(rows))
+            for i, r in enumerate(rows):
+                item0 = QTableWidgetItem(str(r["name"]))
+                item0.setData(Qt.ItemDataRole.UserRole, str(r["scryfall_id"]))
+                self._table.setItem(i, 0, item0)
+                self._table.setItem(i, 1, QTableWidgetItem(str(r["set_code"]).upper()))
+                self._table.setItem(i, 2, self._int_item(int(r["qty"] or 0)))
+
+        self._with_table_sort_preserved(self._table, _fill)
 
         self.statusBar().showMessage(f"Found {len(rows)} cards (showing up to 500)")
 
@@ -345,7 +485,7 @@ class MainWindow(QMainWindow):
         w = Worker(req)
         w.signals.failed.connect(lambda e: self._img.setText("Image load failed"))
         w.signals.finished.connect(self._on_image_ready)
-        self._pool.start(w)
+        self._start_worker(w)
 
     def _on_image_ready(self, path: object) -> None:
         if not isinstance(path, (str, Path)):
@@ -383,6 +523,7 @@ class MainWindow(QMainWindow):
 
         self._deck_table = QTableWidget(0, 5)
         self._deck_table.setHorizontalHeaderLabels(["Card", "Set", "Collector", "Requested", "Owned"])
+        self._deck_table.setSortingEnabled(True)
         self._deck_table.verticalHeader().setVisible(False)
         self._deck_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         layout.addWidget(self._deck_table, 2)
@@ -439,6 +580,7 @@ class MainWindow(QMainWindow):
 
         self._decks_table = QTableWidget(0, 2)
         self._decks_table.setHorizontalHeaderLabels(["Name", "Updated"])
+        self._decks_table.setSortingEnabled(True)
         self._decks_table.verticalHeader().setVisible(False)
         self._decks_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self._decks_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -494,6 +636,7 @@ class MainWindow(QMainWindow):
 
         self._deck_search_results = QTableWidget(0, 4)
         self._deck_search_results.setHorizontalHeaderLabels(["Card", "Set", "Collector", "Type"])
+        self._deck_search_results.setSortingEnabled(True)
         self._deck_search_results.verticalHeader().setVisible(False)
         self._deck_search_results.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self._deck_search_results.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -511,6 +654,7 @@ class MainWindow(QMainWindow):
 
         self._deck_cards_table = QTableWidget(0, 6)
         self._deck_cards_table.setHorizontalHeaderLabels(["Card", "Set", "Collector", "Requested", "Owned", "Status"])
+        self._deck_cards_table.setSortingEnabled(True)
         self._deck_cards_table.verticalHeader().setVisible(False)
         self._deck_cards_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         right_layout.addWidget(self._deck_cards_table, 2)
@@ -638,14 +782,18 @@ class MainWindow(QMainWindow):
             "LIMIT 200"
         )
         rows = self._conn.execute(sql, params).fetchall()
-        self._deck_search_results.setRowCount(len(rows))
-        for i, r in enumerate(rows):
-            item0 = QTableWidgetItem(str(r["name"]))
-            item0.setData(Qt.ItemDataRole.UserRole, str(r["scryfall_id"]))
-            self._deck_search_results.setItem(i, 0, item0)
-            self._deck_search_results.setItem(i, 1, QTableWidgetItem(str(r["set_code"]).upper()))
-            self._deck_search_results.setItem(i, 2, QTableWidgetItem(str(r["collector_number"]) or ""))
-            self._deck_search_results.setItem(i, 3, QTableWidgetItem(str(r["type_line"]) or ""))
+
+        def _fill() -> None:
+            self._deck_search_results.setRowCount(len(rows))
+            for i, r in enumerate(rows):
+                item0 = QTableWidgetItem(str(r["name"]))
+                item0.setData(Qt.ItemDataRole.UserRole, str(r["scryfall_id"]))
+                self._deck_search_results.setItem(i, 0, item0)
+                self._deck_search_results.setItem(i, 1, QTableWidgetItem(str(r["set_code"]).upper()))
+                self._deck_search_results.setItem(i, 2, QTableWidgetItem(str(r["collector_number"]) or ""))
+                self._deck_search_results.setItem(i, 3, QTableWidgetItem(str(r["type_line"]) or ""))
+
+        self._with_table_sort_preserved(self._deck_search_results, _fill)
 
         if len(rows) > 0:
             self._deck_search_results.selectRow(0)
@@ -868,32 +1016,37 @@ class MainWindow(QMainWindow):
             return
 
         self.statusBar().showMessage(f"Deck validation complete — {len(rows)} line(s)")
-        self._deck_table.setRowCount(len(rows))
-        missing = 0
-        partial = 0
-        for i, r in enumerate(rows):
-            self._deck_table.setItem(i, 0, QTableWidgetItem(getattr(r, "name", "")))
-            self._deck_table.setItem(i, 1, QTableWidgetItem(getattr(r, "set_code", "") or ""))
-            self._deck_table.setItem(i, 2, QTableWidgetItem(getattr(r, "collector_number", "") or ""))
-            self._deck_table.setItem(i, 3, QTableWidgetItem(str(getattr(r, "requested_qty", 0))))
-            self._deck_table.setItem(i, 4, QTableWidgetItem(str(getattr(r, "owned_qty", 0))))
 
-            status = getattr(r, "status", "")
-            req_qty = int(getattr(r, "requested_qty", 0) or 0)
-            owned_qty = int(getattr(r, "owned_qty", 0) or 0)
-            if status == "Missing":
-                missing += req_qty
-            elif status == "Partial":
-                partial += max(req_qty - owned_qty, 0)
+        def _fill() -> None:
+            self._deck_table.setRowCount(len(rows))
+            missing = 0
+            partial = 0
+            for i, r in enumerate(rows):
+                self._deck_table.setItem(i, 0, QTableWidgetItem(getattr(r, "name", "")))
+                self._deck_table.setItem(i, 1, QTableWidgetItem(getattr(r, "set_code", "") or ""))
+                self._deck_table.setItem(i, 2, QTableWidgetItem(getattr(r, "collector_number", "") or ""))
 
-        buildable = (missing + partial) == 0
-        if buildable:
-            self._deck_summary.setText("Deck is buildable")
-        else:
-            self._deck_summary.setText(
-                f"Deck is not buildable — missing {missing + partial} card(s) total "
-                f"({missing} missing, {partial} short)"
-            )
+                req_qty = int(getattr(r, "requested_qty", 0) or 0)
+                owned_qty = int(getattr(r, "owned_qty", 0) or 0)
+                self._deck_table.setItem(i, 3, self._int_item(req_qty))
+                self._deck_table.setItem(i, 4, self._int_item(owned_qty))
+
+                status = getattr(r, "status", "")
+                if status == "Missing":
+                    missing += req_qty
+                elif status == "Partial":
+                    partial += max(req_qty - owned_qty, 0)
+
+            buildable = (missing + partial) == 0
+            if buildable:
+                self._deck_summary.setText("Deck is buildable")
+            else:
+                self._deck_summary.setText(
+                    f"Deck is not buildable — missing {missing + partial} card(s) total "
+                    f"({missing} missing, {partial} short)"
+                )
+
+        self._with_table_sort_preserved(self._deck_table, _fill)
 
     def _on_decks_validation_done(self, rows: object) -> None:
         self._btn_deck_validate.setEnabled(True)
@@ -902,46 +1055,44 @@ class MainWindow(QMainWindow):
             self._deck_edit_summary.setText("Validation failed")
             return
 
-        self._deck_cards_table.setRowCount(len(rows))
-        missing = 0
-        partial = 0
-        for i, r in enumerate(rows):
-            name = getattr(r, "name", "")
-            set_code = getattr(r, "set_code", "") or ""
-            collector = getattr(r, "collector_number", "") or ""
-            req_qty = int(getattr(r, "requested_qty", 0) or 0)
-            owned_qty = int(getattr(r, "owned_qty", 0) or 0)
-            status = getattr(r, "status", "")
 
-            self._deck_cards_table.setItem(i, 0, QTableWidgetItem(name))
-            self._deck_cards_table.setItem(i, 1, QTableWidgetItem(set_code))
-            self._deck_cards_table.setItem(i, 2, QTableWidgetItem(collector))
-            self._deck_cards_table.setItem(i, 3, QTableWidgetItem(str(req_qty)))
-            self._deck_cards_table.setItem(i, 4, QTableWidgetItem(str(owned_qty)))
-            self._deck_cards_table.setItem(i, 5, QTableWidgetItem(status))
+        def _fill() -> None:
+            self._deck_cards_table.setRowCount(len(rows))
+            missing = 0
+            partial = 0
+            for i, r in enumerate(rows):
+                name = getattr(r, "name", "")
+                set_code = getattr(r, "set_code", "") or ""
+                collector = getattr(r, "collector_number", "") or ""
+                req_qty = int(getattr(r, "requested_qty", 0) or 0)
+                owned_qty = int(getattr(r, "owned_qty", 0) or 0)
+                status = getattr(r, "status", "")
 
-            if status == "Missing":
-                missing += req_qty
-            elif status == "Partial":
-                partial += max(req_qty - owned_qty, 0)
+                self._deck_cards_table.setItem(i, 0, QTableWidgetItem(name))
+                self._deck_cards_table.setItem(i, 1, QTableWidgetItem(set_code))
+                self._deck_cards_table.setItem(i, 2, QTableWidgetItem(collector))
+                self._deck_cards_table.setItem(i, 3, self._int_item(req_qty))
+                self._deck_cards_table.setItem(i, 4, self._int_item(owned_qty))
+                self._deck_cards_table.setItem(i, 5, QTableWidgetItem(status))
 
-        buildable = (missing + partial) == 0
-        if buildable:
-            self._deck_edit_summary.setText("Deck is buildable")
-        else:
-            self._deck_edit_summary.setText(
-                f"Deck is not buildable — missing {missing + partial} card(s) total ({missing} missing, {partial} short)"
-            )
+                if status == "Missing":
+                    missing += req_qty
+                elif status == "Partial":
+                    partial += max(req_qty - owned_qty, 0)
+
+            buildable = (missing + partial) == 0
+            if buildable:
+                self._deck_edit_summary.setText("Deck is buildable")
+            else:
+                self._deck_edit_summary.setText(
+                    f"Deck is not buildable — missing {missing + partial} card(s) total ({missing} missing, {partial} short)"
+                )
+
+        self._with_table_sort_preserved(self._deck_cards_table, _fill)
 
     # -------------------------
     # Startup jobs
     # -------------------------
-    def _has_pending_csvs(self) -> bool:
-        for folder in imports_dirs():
-            if folder.exists() and any(folder.glob("*.csv")):
-                return True
-        return False
-
     def _startup_begin(self) -> None:
         if self._startup_has_run:
             return
@@ -985,11 +1136,8 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Scryfall setup deferred — search and CSV import are unavailable")
             return
 
-        # Not required: app is usable. Still import pending CSVs if any.
-        if self._has_pending_csvs():
-            self._run_csv_import(show_summary=False)
-        else:
-            self.statusBar().showMessage("Ready")
+        # Not required: app is usable.
+        self.statusBar().showMessage("Ready")
 
     def _run_scryfall_check_only(self) -> None:
         self.statusBar().showMessage("Checking Scryfall updates…")
@@ -997,17 +1145,14 @@ class MainWindow(QMainWindow):
         w = Worker(req)
         w.signals.failed.connect(lambda err: self._on_scryfall_check_done(False))
         w.signals.finished.connect(lambda available: self._on_scryfall_check_done(bool(available)))
-        self._pool.start(w)
+        self._start_worker(w)
 
     def _on_scryfall_check_done(self, available: bool) -> None:
         if available:
             self._prompt_scryfall_update(is_required=False)
             return
 
-        if self._has_pending_csvs():
-            self._run_csv_import(show_summary=False)
-        else:
-            self.statusBar().showMessage("Ready")
+        self.statusBar().showMessage("Ready")
 
     def _show_progress(self, title: str) -> None:
         if self._progress is not None:
@@ -1042,7 +1187,7 @@ class MainWindow(QMainWindow):
         w.signals.progress.connect(self._on_progress)
         w.signals.failed.connect(self._on_worker_failed)
         w.signals.finished.connect(lambda _: self._on_scryfall_done())
-        self._pool.start(w)
+        self._start_worker(w)
 
     def _on_scryfall_status(self, text: str, *, show_dialog: bool) -> None:
         # Pop the modal lazily only if a download/import is actually happening.
@@ -1060,71 +1205,6 @@ class MainWindow(QMainWindow):
         self.refresh_search()
         self.refresh_stats()
 
-        # After Scryfall is ready, import CSVs once per startup.
-        self._run_csv_import(show_summary=False)
-
-    def _run_csv_import(self, *, show_summary: bool) -> None:
-        # If Scryfall is still missing (shouldn't happen with chained startup), don't import.
-        if self._conn.execute("SELECT COUNT(*) FROM printings").fetchone()[0] == 0:
-            QMessageBox.information(
-                self,
-                "CSV import",
-                "Scryfall card data is not ready yet. Please finish the initial Scryfall download/import first.",
-            )
-            return
-
-        self._csv_import_show_summary = show_summary
-
-        self._show_progress("Importing CSVs…")
-        req = WorkerRequest(fn=_csv_worker, kwargs={"db_file": str(db_path())})
-        w = Worker(req)
-        w.signals.status.connect(self._progress.setLabelText)  # type: ignore[union-attr]
-        w.signals.progress.connect(self._on_progress)
-        w.signals.failed.connect(self._on_worker_failed)
-        w.signals.finished.connect(lambda res: self._on_csv_done(res))
-        self._pool.start(w)
-
-    def _on_csv_done(self, result: object) -> None:
-        self._close_progress()
-        self.refresh_search()
-        self.refresh_stats()
-
-        summary = "CSV import complete"
-        details = ""
-        if isinstance(result, list):
-            imported_files = [r for r in result if getattr(r, "skipped_already_imported", False) is False]
-            skipped_files = [r for r in result if getattr(r, "skipped_already_imported", False) is True]
-            qty_added = sum(int(getattr(r, "quantity_added", 0) or 0) for r in imported_files)
-            matched_distinct = sum(int(getattr(r, "distinct_printings_matched", 0) or 0) for r in imported_files)
-            unmatched_rows = sum(int(getattr(r, "rows_unmatched", 0) or 0) for r in imported_files)
-            summary = (
-                f"CSV import complete — {len(imported_files)} imported, {len(skipped_files)} skipped, "
-                f"{qty_added} total copies added"
-            )
-
-            # Per-file details (keep it compact).
-            lines: list[str] = []
-            for r in result:
-                name = getattr(r, "file").name if getattr(r, "file", None) is not None else "(unknown)"
-                if getattr(r, "skipped_already_imported", False):
-                    lines.append(f"- {name}: skipped (already imported)")
-                else:
-                    lines.append(
-                        f"- {name}: +{int(getattr(r, 'quantity_added', 0) or 0)} copies, "
-                        f"{int(getattr(r, 'distinct_printings_matched', 0) or 0)} printings matched, "
-                        f"{int(getattr(r, 'rows_unmatched', 0) or 0)} unmatched rows"
-                    )
-            details = "\n".join(lines)
-
-        self.statusBar().showMessage(summary)
-
-        if self._csv_import_show_summary:
-            msg = summary
-            if details:
-                msg += "\n\n" + details
-            QMessageBox.information(self, "CSV import", msg)
-        self._csv_import_show_summary = False
-
     def _import_csv_via_dialog(self) -> None:
         files, _ = QFileDialog.getOpenFileNames(
             self,
@@ -1135,46 +1215,60 @@ class MainWindow(QMainWindow):
         if not files:
             return
 
-        # Copy into the preferred imports folder so the app stays consistent with its
-        # 'imports folder' model, and so dedupe-by-hash works across runs.
-        target_dir = None
-        for d in imports_dirs():
-            if d.name.lower() == "imports":
-                target_dir = d
-                break
-        if target_dir is None:
-            target_dir = imports_dirs()[0]
-        target_dir.mkdir(parents=True, exist_ok=True)
-
-        copied = 0
-        for src in files:
-            src_path = Path(src)
-            if not src_path.exists():
-                continue
-            dest = target_dir / src_path.name
-            if dest.exists():
-                stem = dest.stem
-                suffix = dest.suffix
-                dest = target_dir / f"{stem}_{int(time.time())}{suffix}"
-            try:
-                shutil.copy2(src_path, dest)
-                copied += 1
-            except Exception:
-                continue
-
-        if copied == 0:
-            QMessageBox.warning(self, "CSV import", "No files could be copied into the imports folder.")
+        # Import directly from the selected file(s) (do not copy/store them).
+        paths = [Path(f) for f in files if f]
+        paths = [p for p in paths if p.exists()]
+        if not paths:
             return
 
-        self.statusBar().showMessage(f"Copied {copied} CSV file(s) into {target_dir}")
-        self._run_csv_import(show_summary=True)
+        self._show_progress("Importing CSV…")
+        req = WorkerRequest(
+            fn=_import_selected_csvs_worker,
+            kwargs={"db_file": str(db_path()), "files": [str(p) for p in paths]},
+        )
+        w = Worker(req)
+        w.signals.status.connect(self._progress.setLabelText)  # type: ignore[union-attr]
+        w.signals.progress.connect(self._on_progress)
+        w.signals.failed.connect(self._on_worker_failed)
+        w.signals.finished.connect(lambda res: self._on_selected_csv_import_done(res))
+        self._start_worker(w)
+
+    def _on_selected_csv_import_done(self, result: object) -> None:
+        self._close_progress()
+        self.refresh_search()
+        self.refresh_stats()
+
+        if not isinstance(result, list):
+            self.statusBar().showMessage("CSV import complete")
+            box = QMessageBox(self)
+            box.setWindowTitle("CSV import")
+            box.setIcon(QMessageBox.Icon.Information)
+            box.setText("CSV import complete")
+            box.setStandardButtons(QMessageBox.StandardButton.Ok)
+            box.setWindowModality(Qt.WindowModality.WindowModal)
+            box.exec()
+            return
+
+        imported_files = [r for r in result if getattr(r, "skipped_already_imported", False) is False]
+        skipped_files = [r for r in result if getattr(r, "skipped_already_imported", False) is True]
+        qty_added = sum(int(getattr(r, "quantity_added", 0) or 0) for r in imported_files)
+
+        summary = f"Import complete — {len(imported_files)} imported, {len(skipped_files)} skipped, +{qty_added} copies"
+        self.statusBar().showMessage(summary)
+        box = QMessageBox(self)
+        box.setWindowTitle("CSV import")
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setText(summary)
+        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        box.setWindowModality(Qt.WindowModality.WindowModal)
+        box.exec()
 
     def _run_update_check(self) -> None:
         req = WorkerRequest(fn=_update_worker, kwargs={})
         w = Worker(req)
         w.signals.failed.connect(lambda _: None)
         w.signals.finished.connect(self._on_update_result)
-        self._pool.start(w)
+        self._start_worker(w)
 
     def _on_update_result(self, result: object) -> None:
         if result is None:
@@ -1234,14 +1328,58 @@ def _scryfall_check_worker(*, db_file: str, on_status, on_progress) -> object:
     return bool(available)
 
 
-def _csv_worker(*, db_file: str, on_status, on_progress) -> object:
+def _import_selected_csvs_worker(*, db_file: str, files: list[str], on_status, on_progress) -> object:
     from mtg_cards.db import connect, init_db
+    from mtg_cards.csv_importer import ImportResult, import_csv_file
 
     conn = connect(Path(db_file))
     init_db(conn)
-    results = import_all_csvs(conn=conn, on_status=on_status, on_progress=on_progress)
+
+    results: list[ImportResult] = []
+    paths = [Path(f) for f in (files or []) if f]
+    total = len(paths)
+    done = 0
+    for p in paths:
+        done += 1
+        on_progress(done, total)
+        on_status(f"Importing CSV {done}/{total}: {p.name}")
+        try:
+            results.append(import_csv_file(conn, p))
+        except Exception:
+            # Keep going; surface errors in UI logs.
+            results.append(
+                ImportResult(
+                    file=p,
+                    skipped_already_imported=False,
+                    rows_seen=0,
+                    rows_imported=0,
+                    rows_unmatched=0,
+                    quantity_added=0,
+                    distinct_printings_matched=0,
+                )
+            )
+
     conn.close()
     return results
+
+
+def _import_mapped_file_worker(*, db_file: str, source_path: str, mode: str, mapping: dict, on_status, on_progress) -> object:
+    from mtg_cards.db import connect, init_db
+    from mtg_cards.csv_importer import import_mapped_file
+
+    on_status("Reading file…")
+    # Indeterminate while we parse/import.
+    on_progress(0, 0)
+
+    conn = connect(Path(db_file))
+    init_db(conn)
+    on_status("Importing…")
+    result = import_mapped_file(conn, source_path=Path(source_path), mode=str(mode), mapping=dict(mapping))
+    conn.close()
+    on_status("Import complete")
+    # Trigger QProgressDialog auto-close behavior (determinate completion).
+    on_progress(1, 1)
+    return result
 
 
 def _deck_validate_worker(*, db_file: str, deck_text: str, on_status, on_progress) -> object:
