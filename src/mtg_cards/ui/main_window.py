@@ -4,8 +4,8 @@ import json
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QThreadPool, Qt, QTimer, QStringListModel
-from PySide6.QtGui import QPixmap
+from PySide6.QtCore import QThreadPool, Qt, QTimer, QStringListModel, QSize
+from PySide6.QtGui import QIcon, QPixmap
 from PySide6.QtWidgets import (
     QComboBox,
     QFormLayout,
@@ -36,7 +36,7 @@ from mtg_cards.db import clear_imported_cards, connect, init_db, json_loads
 from mtg_cards.decks import create_deck, delete_deck, get_deck, list_decks, update_deck
 from mtg_cards.deck import parse_decklist, validate_deck
 from mtg_cards.images import fetch_image_to_cache
-from mtg_cards.paths import db_path
+from mtg_cards.paths import app_root, db_path
 from mtg_cards.startup import check_app_update, ensure_scryfall_up_to_date, scryfall_update_available
 from mtg_cards.workers import Worker, WorkerRequest
 from mtg_cards.ui.import_mapper import ImportMapperDialog
@@ -78,12 +78,14 @@ class MainWindow(QMainWindow):
         self._tabs = QTabWidget()
         self._tabs.addTab(self._build_collection_tab(), "Collection")
         self._tabs.addTab(self._build_stats_tab(), "Stats")
+        self._tabs.addTab(self._build_sets_tab(), "Sets")
         self._tab_index_decks = self._tabs.addTab(self._build_decks_tab(), "Decks")
         self._tab_index_validator = self._tabs.addTab(self._build_deck_tab(), "Deck Validator")
         self.setCentralWidget(self._tabs)
         self.setStatusBar(QStatusBar(self))
 
         self.refresh_stats()
+        self.refresh_sets()
 
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
@@ -173,7 +175,290 @@ class MainWindow(QMainWindow):
 
         self.refresh_search()
         self.refresh_stats()
+        self.refresh_sets()
         self.statusBar().showMessage("Imported cards cleared")
+
+    # -------------------------
+    # UI: Sets
+    # -------------------------
+    def _build_sets_tab(self) -> QWidget:
+        root = QWidget()
+        layout = QHBoxLayout(root)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        layout.addWidget(splitter)
+
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        left_layout.addWidget(QLabel("Sets / editions"))
+
+        self._sets_table = QTableWidget(0, 3)
+        self._sets_table.setHorizontalHeaderLabels(["Set", "Distinct", "Total"])
+        self._sets_table.setSortingEnabled(True)
+        self._sets_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self._sets_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self._sets_table.verticalHeader().setVisible(False)
+        self._sets_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._sets_table.setIconSize(QSize(22, 22))
+        left_layout.addWidget(self._sets_table, 1)
+
+        splitter.addWidget(left)
+
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        right_layout.addWidget(QLabel("Owned cards in selected set"))
+
+        cards_and_details = QSplitter(Qt.Orientation.Horizontal)
+        right_layout.addWidget(cards_and_details, 1)
+
+        self._set_cards_table = QTableWidget(0, 3)
+        self._set_cards_table.setHorizontalHeaderLabels(["Card", "Collector", "Owned"])
+        self._set_cards_table.setSortingEnabled(True)
+        self._set_cards_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self._set_cards_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self._set_cards_table.verticalHeader().setVisible(False)
+        self._set_cards_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        cards_and_details.addWidget(self._set_cards_table)
+
+        # Details (image + Scryfall printing info)
+        detail = QWidget()
+        detail_layout = QVBoxLayout(detail)
+        detail_layout.setSpacing(10)
+        detail_layout.setContentsMargins(8, 8, 8, 8)
+
+        self._set_img = MainWindow._AspectRatioPixmapLabel()
+        self._set_img.setText("Select a card")
+        self._set_img.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._set_img.setMinimumWidth(320)
+        detail_layout.addWidget(self._set_img, 3)
+
+        self._set_detail = QTextEdit()
+        self._set_detail.setReadOnly(True)
+        detail_layout.addWidget(self._set_detail, 2)
+
+        cards_and_details.addWidget(detail)
+        cards_and_details.setStretchFactor(0, 3)
+        cards_and_details.setStretchFactor(1, 2)
+
+        splitter.addWidget(right)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 3)
+
+        self._sets_table.itemSelectionChanged.connect(self._on_set_selected)
+        self._set_cards_table.itemSelectionChanged.connect(self._on_set_card_selected)
+        return root
+
+    def _set_icon_path(self, set_code: str) -> Path | None:
+        code = (set_code or "").strip().upper()
+        if not code:
+            return None
+        p = app_root() / "set" / code / "80.svg"
+        return p if p.exists() else None
+
+    def refresh_sets(self) -> None:
+        # If Scryfall is missing, nothing to show.
+        if self._conn.execute("SELECT COUNT(*) FROM printings").fetchone()[0] == 0:
+            if hasattr(self, "_sets_table"):
+                self._sets_table.setRowCount(0)
+            if hasattr(self, "_set_cards_table"):
+                self._set_cards_table.setRowCount(0)
+            return
+
+        rows = self._conn.execute(
+            """
+            SELECT p.set_code AS set_code,
+                   COUNT(*) AS distinct_printings,
+                   SUM(op.quantity) AS total_copies
+            FROM owned_printings op
+            JOIN printings p ON p.scryfall_id = op.scryfall_id
+            WHERE op.quantity > 0
+            GROUP BY p.set_code
+            ORDER BY total_copies DESC, p.set_code ASC
+            """
+        ).fetchall()
+
+        def _fill() -> None:
+            self._sets_table.setRowCount(len(rows))
+            for i, r in enumerate(rows):
+                set_code = str(r["set_code"] or "").upper()
+                distinct = int(r["distinct_printings"] or 0)
+                total = int(r["total_copies"] or 0)
+
+                it_set = QTableWidgetItem(set_code)
+                it_set.setData(Qt.ItemDataRole.UserRole, set_code)
+                icon_path = self._set_icon_path(set_code)
+                if icon_path is not None:
+                    it_set.setIcon(QIcon(str(icon_path)))
+
+                self._sets_table.setItem(i, 0, it_set)
+                self._sets_table.setItem(i, 1, self._int_item(distinct))
+                self._sets_table.setItem(i, 2, self._int_item(total))
+
+        self._with_table_sort_preserved(self._sets_table, _fill)
+
+        if len(rows) > 0 and not self._sets_table.selectedItems():
+            self._sets_table.selectRow(0)
+        elif len(rows) == 0:
+            self._set_cards_table.setRowCount(0)
+
+    def _on_set_selected(self) -> None:
+        self._clear_set_card_details()
+        items = self._sets_table.selectedItems() if hasattr(self, "_sets_table") else []
+        if not items:
+            if hasattr(self, "_set_cards_table"):
+                self._set_cards_table.setRowCount(0)
+            return
+
+        set_code = items[0].data(Qt.ItemDataRole.UserRole)
+        if not set_code:
+            self._set_cards_table.setRowCount(0)
+            return
+
+        rows = self._conn.execute(
+            """
+             SELECT p.scryfall_id AS scryfall_id,
+                 p.name AS name,
+                   p.collector_number AS collector_number,
+                   op.quantity AS quantity
+            FROM owned_printings op
+            JOIN printings p ON p.scryfall_id = op.scryfall_id
+            WHERE op.quantity > 0 AND p.set_code = ?
+            ORDER BY p.name COLLATE NOCASE ASC, p.collector_number ASC
+            """,
+            (str(set_code).lower(),),
+        ).fetchall()
+
+        def _fill() -> None:
+            self._set_cards_table.setRowCount(len(rows))
+            for i, r in enumerate(rows):
+                it_name = QTableWidgetItem(str(r["name"] or ""))
+                it_name.setData(Qt.ItemDataRole.UserRole, str(r["scryfall_id"] or ""))
+                self._set_cards_table.setItem(i, 0, it_name)
+                self._set_cards_table.setItem(i, 1, QTableWidgetItem(str(r["collector_number"] or "")))
+                self._set_cards_table.setItem(i, 2, self._int_item(int(r["quantity"] or 0)))
+
+        self._with_table_sort_preserved(self._set_cards_table, _fill)
+
+        if len(rows) > 0:
+            # Force-refresh details even when row 0 remains selected.
+            self._set_cards_table.setCurrentCell(0, 0)
+            self._set_cards_table.selectRow(0)
+            first_id = str(rows[0]["scryfall_id"] or "")
+            if first_id:
+                self._show_set_card_details(first_id)
+        else:
+            self._clear_set_card_details()
+
+    def _on_set_card_selected(self) -> None:
+        items = self._set_cards_table.selectedItems() if hasattr(self, "_set_cards_table") else []
+        if not items:
+            self._clear_set_card_details()
+            return
+
+        scryfall_id = items[0].data(Qt.ItemDataRole.UserRole)
+        if not scryfall_id:
+            return
+
+        self._show_set_card_details(str(scryfall_id))
+
+    def _clear_set_card_details(self) -> None:
+        if hasattr(self, "_set_img"):
+            self._set_img.clear_pixmap()
+            self._set_img.setText("Select a card")
+        if hasattr(self, "_set_detail"):
+            self._set_detail.clear()
+
+    def _show_set_card_details(self, scryfall_id: str) -> None:
+        card = self._conn.execute(
+            "SELECT * FROM printings WHERE scryfall_id = ?",
+            (str(scryfall_id),),
+        ).fetchone()
+        if card is None:
+            return
+
+        owned = self._conn.execute(
+            "SELECT COALESCE(quantity, 0) FROM owned_printings WHERE scryfall_id = ?",
+            (str(scryfall_id),),
+        ).fetchone()
+        owned_qty = int(owned[0]) if owned else 0
+
+        detail_lines = [
+            f"{card['name']}  ({card['set_code'].upper()} {card['collector_number']})",
+            f"Owned: {owned_qty}",
+            "",
+            card["mana_cost"] or "",
+            card["type_line"] or "",
+            f"Rarity: {card['rarity'] or ''}",
+            "",
+            card["oracle_text"] or "",
+        ]
+        self._set_detail.setPlainText("\n".join([l for l in detail_lines if l is not None]))
+
+        image_url = _best_image_url(card)
+        if image_url:
+            self._load_image_async_into(self._set_img, image_url)
+        else:
+            self._set_img.clear_pixmap()
+            self._set_img.setText("No image")
+
+    def _load_image_async_into(self, label: "MainWindow._AspectRatioPixmapLabel", url: str) -> None:
+        label.clear_pixmap()
+        label.setText("Loading image…")
+
+        req = WorkerRequest(fn=_fetch_image_worker, kwargs={"url": url})
+        w = Worker(req)
+
+        def _fail(_e: object) -> None:
+            label.setText("Image load failed")
+
+        def _done(path: object) -> None:
+            if not isinstance(path, (str, Path)):
+                label.setText("Image load failed")
+                return
+            p = Path(path)
+            if not p.exists():
+                label.setText("Image not found")
+                return
+            pix = QPixmap(str(p))
+            if pix.isNull():
+                label.setText("Image decode failed")
+                return
+            label.setPixmap(pix)
+
+        w.signals.failed.connect(_fail)
+        w.signals.finished.connect(_done)
+        self._start_worker(w)
+
+    class _AspectRatioPixmapLabel(QLabel):
+        def __init__(self) -> None:
+            super().__init__()
+            self._original: QPixmap | None = None
+            self.setMinimumHeight(240)
+
+        def clear_pixmap(self) -> None:
+            self._original = None
+            super().clear()
+
+        def setPixmap(self, pixmap: QPixmap) -> None:  # type: ignore[override]
+            self._original = pixmap
+            self._rescale()
+
+        def resizeEvent(self, event) -> None:  # type: ignore[override]
+            super().resizeEvent(event)
+            self._rescale()
+
+        def _rescale(self) -> None:
+            if self._original is None or self._original.isNull():
+                return
+            target = self.size()
+            if target.width() <= 1 or target.height() <= 1:
+                return
+            scaled = self._original.scaled(
+                target,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            super().setPixmap(scaled)
 
     def _import_file_with_mapping(self) -> None:
         file, _ = QFileDialog.getOpenFileName(
@@ -228,6 +513,7 @@ class MainWindow(QMainWindow):
         self._close_progress()
         self.refresh_search()
         self.refresh_stats()
+        self.refresh_sets()
 
         if result is None:
             self.statusBar().showMessage("Import complete")
@@ -1237,6 +1523,7 @@ class MainWindow(QMainWindow):
         self._close_progress()
         self.refresh_search()
         self.refresh_stats()
+        self.refresh_sets()
 
         if not isinstance(result, list):
             self.statusBar().showMessage("CSV import complete")
